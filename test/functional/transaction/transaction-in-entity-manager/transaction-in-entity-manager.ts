@@ -8,6 +8,7 @@ import { DataSource } from "../../../../src/data-source/DataSource"
 import { Post } from "./entity/Post"
 import { Category } from "./entity/Category"
 import { expect } from "chai"
+import { TransactionAbortedError } from "../../../../src/error/TransactionAbortedError"
 
 describe("transaction > transaction with entity manager", () => {
     let connections: DataSource[]
@@ -123,6 +124,77 @@ describe("transaction > transaction with entity manager", () => {
                     where: { name: "Category #1" },
                 })
                 expect(category).to.be.null
+            }),
+        ))
+
+    it("should fail when signal is aborted", () =>
+        Promise.all(
+            connections.map(async (connection) => {
+                const posts: { id: number; title: string }[] = []
+
+                const controller = new AbortController()
+                const sleep = (ms: number) =>
+                    new Promise((resolve) => setTimeout(resolve, ms))
+
+                setTimeout(() => controller.abort(), 500)
+
+                try {
+                    await connection.manager.transaction(
+                        { signal: controller.signal },
+                        async (em0) => {
+                            const post = new Post()
+                            post.title = "Post #1"
+                            await em0.save(post)
+
+                            posts.push({ ...post })
+
+                            await sleep(500)
+                        },
+                    )
+                } catch (error) {
+                    expect(error).to.be.instanceOf(TransactionAbortedError)
+                }
+
+                for (const post of posts) {
+                    const foundPost = await connection.manager.findOne(Post, {
+                        where: { title: post.title },
+                    })
+
+                    expect(foundPost).to.be.null
+                }
+            }),
+        ))
+
+    it("should fail when aborted signal is given", () =>
+        Promise.all(
+            connections.map(async (connection) => {
+                const posts: { id: number; title: string }[] = []
+
+                const controller = new AbortController()
+                controller.abort()
+
+                try {
+                    await connection.manager.transaction(
+                        { signal: controller.signal },
+                        async (em0) => {
+                            const post = new Post()
+                            post.title = "Post #1"
+                            await em0.save(post)
+
+                            posts.push({ ...post })
+                        },
+                    )
+                } catch (error) {
+                    expect(error).to.be.instanceOf(TransactionAbortedError)
+                }
+
+                for (const post of posts) {
+                    const foundPost = await connection.manager.findOne(Post, {
+                        where: { title: post.title },
+                    })
+
+                    expect(foundPost).to.be.null
+                }
             }),
         ))
 })

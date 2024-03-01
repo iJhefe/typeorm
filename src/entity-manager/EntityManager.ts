@@ -38,6 +38,8 @@ import { UpsertOptions } from "../repository/UpsertOptions"
 import { InstanceChecker } from "../util/InstanceChecker"
 import { ObjectLiteral } from "../common/ObjectLiteral"
 import { PickKeysByType } from "../common/PickKeysByType"
+import { TransactionOptions } from "../driver/types/TransactionOptions"
+import { TransactionAbortedError } from "../error/TransactionAbortedError"
 
 /**
  * Entity manager supposed to work with any entity, automatically find its repository and call its methods,
@@ -107,6 +109,11 @@ export class EntityManager {
         runInTransaction: (entityManager: EntityManager) => Promise<T>,
     ): Promise<T>
 
+    async transaction<T>(
+        options: TransactionOptions,
+        runInTransaction: (entityManager: EntityManager) => Promise<T>,
+    ): Promise<T>
+
     /**
      * Wraps given function execution (and all operations made there) in a transaction.
      * All database operations must be executed using provided entity manager.
@@ -123,13 +130,24 @@ export class EntityManager {
     async transaction<T>(
         isolationOrRunInTransaction:
             | IsolationLevel
+            | TransactionOptions
             | ((entityManager: EntityManager) => Promise<T>),
         runInTransactionParam?: (entityManager: EntityManager) => Promise<T>,
     ): Promise<T> {
-        const isolation =
-            typeof isolationOrRunInTransaction === "string"
-                ? isolationOrRunInTransaction
-                : undefined
+        let isolation: IsolationLevel | undefined = undefined
+
+        if (typeof isolationOrRunInTransaction === "string") {
+            isolation = isolationOrRunInTransaction
+        } else if (typeof isolationOrRunInTransaction === "object") {
+            isolation = isolationOrRunInTransaction.isolation
+        }
+
+        const signal: AbortSignal | undefined = ObjectUtils.isObject(
+            isolationOrRunInTransaction,
+        )
+            ? (isolationOrRunInTransaction as TransactionOptions).signal
+            : undefined
+
         const runInTransaction =
             typeof isolationOrRunInTransaction === "function"
                 ? isolationOrRunInTransaction
@@ -149,22 +167,49 @@ export class EntityManager {
         const queryRunner =
             this.queryRunner || this.connection.createQueryRunner()
 
-        try {
-            await queryRunner.startTransaction(isolation)
-            const result = await runInTransaction(queryRunner.manager)
-            await queryRunner.commitTransaction()
-            return result
-        } catch (err) {
+        return new Promise(async (resolve, reject) => {
+            const abortTransactionSignal = async () => {
+                // If we are in a transaction, we need to rollback it.
+                if (queryRunner.isTransactionActive)
+                    await queryRunner.rollbackTransaction()
+
+                // If we are using a new query runner provider then release it
+                if (!this.queryRunner && !queryRunner.isReleased)
+                    await queryRunner.release()
+
+                reject(new TransactionAbortedError())
+            }
+
+            // If the signal is already aborted, we abort the transaction early.
+            if (signal?.aborted) return abortTransactionSignal()
+
+            if (signal)
+                signal.addEventListener("abort", abortTransactionSignal, {
+                    once: true,
+                })
+
             try {
-                // we throw original error even if rollback thrown an error
-                await queryRunner.rollbackTransaction()
-            } catch (rollbackError) {}
-            throw err
-        } finally {
-            if (!this.queryRunner)
-                // if we used a new query runner provider then release it
-                await queryRunner.release()
-        }
+                await queryRunner.startTransaction(isolation)
+                const result = await runInTransaction(queryRunner.manager)
+                await queryRunner.commitTransaction()
+
+                resolve(result)
+            } catch (err) {
+                try {
+                    // we throw original error even if rollback thrown an error
+                    await queryRunner.rollbackTransaction()
+                } catch (rollbackError) {}
+
+                reject(err)
+            } finally {
+                if (!this.queryRunner)
+                    // if we used a new query runner provider then release it
+                    await queryRunner.release()
+
+                if (signal)
+                    signal.removeEventListener("abort", abortTransactionSignal)
+            }
+        })
     }
 
     /**
